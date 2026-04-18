@@ -16,10 +16,13 @@ If you expose the server to a LAN or the public internet, you're responsible for
 | Asset | Mechanism |
 |---|---|
 | Ingested document content | Bearer auth on every data endpoint (`/query`, `/stats`, `/sources`, `/libraries`) |
-| API key at rest | File mode `0600`, regenerated via `lens key` when deleted |
+| API key at rest | File mode `0600`, atomic `O_EXCL` creation (no loose-perm window), regenerated via `lens key` when deleted |
 | Against timing attacks on the key | `secrets.compare_digest` on the bearer comparison |
 | Against library-ID path traversal | `_collection_for` sanitises to `[a-zA-Z0-9_-]`, membership check against registry before any op |
-| Against oversized responses | Bounded `top_k` (clamped `[1, max_chunks]`), bounded chunk/source string lengths |
+| Against oversized responses | Bounded `top_k` (clamped `[1, 100]`), bounded chunk/source string lengths |
+| Against oversized requests | `query` capped at 4 KB, library names at 120 chars (Pydantic `Field(max_length=...)`) |
+| Against cross-origin browser attacks | CORS narrowed from `*` to the PWA domains + localhost + `.onion`. Extend via `LENS_CORS_ORIGINS` env |
+| Against info-leak in errors | 500 responses return generic messages; stack traces and paths stay in `log.exception` server-side only |
 
 ## What the server does NOT protect against
 

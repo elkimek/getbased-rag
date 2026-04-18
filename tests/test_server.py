@@ -237,3 +237,75 @@ def test_rename_nonexistent_library_returns_404(client: TestClient, auth: dict) 
         headers=auth,
     )
     assert r.status_code == 404
+
+
+# ── Security hardening — input validation, CORS, error sanitisation ───
+
+def test_query_rejects_overlong_string(client: TestClient, auth: dict) -> None:
+    """4096-char cap on query — anything larger returns 422 before the
+    embedder runs, capping the tokenizer-DoS attack surface."""
+    r = client.post("/query", json={"version": 1, "query": "x" * 5000, "top_k": 1}, headers=auth)
+    assert r.status_code == 422
+
+
+def test_query_rejects_negative_top_k(client: TestClient, auth: dict) -> None:
+    r = client.post("/query", json={"version": 1, "query": "x", "top_k": -1}, headers=auth)
+    assert r.status_code == 422
+
+
+def test_library_rejects_overlong_name(client: TestClient, auth: dict) -> None:
+    r = client.post("/libraries", json={"name": "x" * 500}, headers=auth)
+    assert r.status_code == 422
+
+
+def test_library_rename_rejects_empty(client: TestClient, auth: dict) -> None:
+    # First get a real library id to rename
+    client.get("/stats", headers=auth)
+    libs = client.get("/libraries", headers=auth).json()["libraries"]
+    r = client.patch(f"/libraries/{libs[0]['id']}", json={"name": ""}, headers=auth)
+    assert r.status_code == 422
+
+
+def test_cors_allows_pwa_origin(client: TestClient) -> None:
+    r = client.options(
+        "/query",
+        headers={
+            "Origin": "https://app.getbased.health",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers.get("access-control-allow-origin") == "https://app.getbased.health"
+
+
+def test_cors_blocks_random_origin(client: TestClient) -> None:
+    """A random website visited by a user running this server on localhost
+    must not be able to read cross-origin responses. Preflight without a
+    matching origin should not echo the origin back."""
+    r = client.options(
+        "/query",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    # Either 400 (no allow-origin header at all) or 200 with no allow-origin
+    # echoed — both are browser-blocking. Any echo of evil.example is a bug.
+    assert r.headers.get("access-control-allow-origin") != "https://evil.example"
+
+
+def test_500_errors_dont_leak_exception_details(client: TestClient, auth: dict, monkeypatch) -> None:
+    """Verify the 500-response sanitisation — a forced internal error should
+    surface a generic message, not the raw traceback / path / exception repr."""
+    from lens.store import Store
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("secret internal detail /home/user/secrets.txt")
+
+    monkeypatch.setattr(Store, "list_sources", boom)
+    r = client.get("/stats", headers=auth)
+    assert r.status_code == 500
+    body_text = r.text
+    assert "secret internal detail" not in body_text
+    assert "/home/user/secrets.txt" not in body_text
+    assert "see server logs" in body_text

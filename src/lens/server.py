@@ -23,10 +23,12 @@ import secrets
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import os
+
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .api_key import get_or_create_api_key
 from .config import LensConfig
@@ -37,10 +39,13 @@ from .store import QdrantBackend, Store
 log = logging.getLogger("lens.server")
 
 
+# Bounds: queries are single search terms / phrases — 4 KB is plenty for
+# real use and caps a tokenizer-DoS at a fixed ceiling. Library names are
+# short user-facing labels; 120 chars is generous.
 class QueryRequest(BaseModel):
     version: int = 1
-    query: str
-    top_k: int = 5
+    query: str = Field(..., min_length=1, max_length=4096)
+    top_k: int = Field(default=5, ge=1, le=100)
 
 
 class Chunk(BaseModel):
@@ -54,11 +59,11 @@ class QueryResponse(BaseModel):
 
 
 class LibraryCreateRequest(BaseModel):
-    name: str = "Untitled"
+    name: str = Field(default="Untitled", max_length=120)
 
 
 class LibraryRenameRequest(BaseModel):
-    name: str
+    name: str = Field(..., min_length=1, max_length=120)
 
 
 def create_app(config: LensConfig) -> FastAPI:
@@ -154,10 +159,25 @@ def create_app(config: LensConfig) -> FastAPI:
         version="0.3.0",
         lifespan=lifespan,
     )
-    # CORS: allow desktop browser origins. The bearer token gates real access.
+    # CORS: only the getbased PWA origins need browser access to this
+    # server; the MCP and Hermes talk from Python, no CORS check at all.
+    # Users running their own domain can add it via LENS_CORS_ORIGINS
+    # (comma-separated). `*` was the old default; tightening here so a
+    # random webpage visited by the user can't make authenticated
+    # localhost requests with a leaked bearer token.
+    _default_origins = [
+        "https://getbased.health",
+        "https://app.getbased.health",
+        "http://localhost",
+        "http://127.0.0.1",
+    ]
+    _extra_origins = [
+        o.strip() for o in os.environ.get("LENS_CORS_ORIGINS", "").split(",") if o.strip()
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_default_origins + _extra_origins,
+        allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):[0-9]+$|^http://.*\.onion$",
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
@@ -215,9 +235,9 @@ def create_app(config: LensConfig) -> FastAPI:
             sources = store.list_sources()
             total = sum(int(s.get("chunks", 0)) for s in sources)
             return {"total_chunks": total, "documents": sources}
-        except Exception as e:
+        except Exception:
             log.exception("Stats failed")
-            raise HTTPException(500, f"Stats failed: {e}")
+            raise HTTPException(500, "Stats failed — see server logs")
 
     @app.delete("/sources/{source:path}")
     async def delete_source_endpoint(
@@ -230,9 +250,9 @@ def create_app(config: LensConfig) -> FastAPI:
         try:
             deleted = store.delete_by_source(source)
             return {"deleted_chunks": int(deleted)}
-        except Exception as e:
+        except Exception:
             log.exception("Delete failed")
-            raise HTTPException(500, f"Delete failed: {e}")
+            raise HTTPException(500, "Delete failed — see server logs")
 
     @app.delete("/sources")
     async def clear_endpoint(authorization: Optional[str] = Header(default=None)):
@@ -242,9 +262,9 @@ def create_app(config: LensConfig) -> FastAPI:
         try:
             cleared = store.clear()
             return {"deleted_chunks": int(cleared)}
-        except Exception as e:
+        except Exception:
             log.exception("Clear failed")
-            raise HTTPException(500, f"Clear failed: {e}")
+            raise HTTPException(500, "Clear failed — see server logs")
 
     @app.get("/health")
     async def health():
@@ -282,16 +302,16 @@ def create_app(config: LensConfig) -> FastAPI:
         try:
             vectors = embedder.encode([req.query.strip()])
             qvec = vectors[0]
-        except Exception as e:
+        except Exception:
             log.exception("Embedding failed")
-            raise HTTPException(500, f"Embedding failed: {e}")
+            raise HTTPException(500, "Embedding failed — see server logs")
 
         # Search
         try:
             results = store.search(qvec, top_k=top_k, score_threshold=config.similarity_floor)
-        except Exception as e:
+        except Exception:
             log.exception("Vector search failed")
-            raise HTTPException(500, f"Search failed: {e}")
+            raise HTTPException(500, "Search failed — see server logs")
 
         # Truncate per response constraints
         chunks = [
