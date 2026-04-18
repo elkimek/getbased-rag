@@ -1,52 +1,60 @@
 # getbased-rag
 
-A standalone RAG knowledge server — the backend that used to ship inside the getbased Electron desktop app. Now runs anywhere Docker runs, so you can point any client (the getbased PWA's *External server* lens backend, or your own) at it.
+A standalone RAG knowledge server — the backend that used to ship inside the getbased Electron desktop app, now just Python. Point any client (the getbased PWA's *External server* lens backend, or your own) at it.
 
 - **Stack**: FastAPI + Uvicorn · Qdrant (embedded local mode) · sentence-transformers / ONNX Runtime
-- **Port**: 8322
-- **Auth**: Bearer token, auto-generated at `/data/api_key` on first start
-- **Stores**: every library is its own Qdrant collection under `/data/qdrant/`
+- **Default port**: 8322, loopback only
+- **Auth**: Bearer token, auto-generated on first start
+- **Stores**: every library is its own Qdrant collection under the data dir
 
 ---
 
-## Quick start
+## Install
+
+Requires Python ≥ 3.10.
 
 ```bash
-docker compose up -d
-docker compose exec lens lens key     # prints the API key you'll paste into the client
+pipx install "git+https://github.com/elkimek/getbased-rag.git[full]"
 ```
 
-Server is now reachable at `http://127.0.0.1:8322`.
+Or from source:
+
+```bash
+git clone https://github.com/elkimek/getbased-rag.git
+cd getbased-rag
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[full]"
+```
+
+---
+
+## Run
+
+```bash
+lens serve
+```
+
+First start auto-generates an API key at the data dir (see below), prints the bind address, and lazy-loads the embedding model on the first query (~90 MB download for MiniLM).
+
+Copy the API key out when you need to configure a client:
+
+```bash
+lens key
+```
 
 Smoke test:
 
 ```bash
-KEY=$(docker compose exec -T lens lens key)
 curl -s http://127.0.0.1:8322/health
-curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8322/stats
+curl -s -H "Authorization: Bearer $(lens key)" http://127.0.0.1:8322/stats
 ```
 
-Ingest a file:
+Ingest a file or a directory:
 
 ```bash
-docker compose exec lens lens ingest /data/some-document.pdf
-```
-
-(put the file under the `lens-data` volume first — easiest way: `docker cp my.pdf getbased-rag:/data/`).
-
----
-
-## Running without Docker Compose
-
-```bash
-docker run -d \
-  --name getbased-rag \
-  -p 127.0.0.1:8322:8322 \
-  -v lens-data:/data \
-  -e LENS_HOST=0.0.0.0 \
-  ghcr.io/elkimek/getbased-rag:latest
-
-docker exec getbased-rag lens key
+lens ingest ~/Documents/research
+lens stats
 ```
 
 ---
@@ -58,51 +66,48 @@ In the PWA: **Settings → AI → Knowledge Base → External server**
 | Field | Value |
 |---|---|
 | URL | `http://127.0.0.1:8322` |
-| API key | the token printed by `lens key` |
+| API key | output of `lens key` |
 
-Click **Save**, then **Test connection**. If the PWA reports `rag_ready: false`, that's expected — you haven't ingested any documents yet.
+Click **Save**, then **Test connection**. `rag_ready: false` is expected before you ingest anything.
 
 ---
 
 ## Configuration
 
-Every setting is driven by an environment variable. Defaults in parentheses.
+Every setting is an environment variable. Defaults in parentheses.
 
 | Variable | Purpose |
 |---|---|
-| `LENS_HOST` (`127.0.0.1`) | Interface to bind. In Docker this is overridden to `0.0.0.0` so the port mapping works |
+| `LENS_HOST` (`127.0.0.1`) | Bind interface. Change to `0.0.0.0` only if you really want LAN access |
 | `LENS_PORT` (`8322`) | TCP port |
-| `LENS_DATA_DIR` (`/data`) | Where the Qdrant DB, API key, and model cache live |
+| `LENS_DATA_DIR` (platform default) | Where Qdrant DB, API key, and model cache live |
 | `LENS_EMBEDDING_MODEL` (`sentence-transformers/all-MiniLM-L6-v2`) | HF model id |
-| `LENS_SIMILARITY_FLOOR` (`0.55`) | Minimum cosine score for a chunk to be returned |
+| `LENS_SIMILARITY_FLOOR` (`0.55`) | Minimum cosine score for a returned chunk |
 | `LENS_ONNX_PROVIDER` (auto) | `cuda` \| `rocm` \| `openvino` \| `coreml` \| `cpu` |
 | `LENS_RERANKER` (`false`) | Enable reranking of top candidates |
 | `LENS_CHUNK_MAX_SIZE` (`800`) | Max chunk size in characters |
 
-The model is downloaded from HuggingFace on first query (~90 MB for MiniLM) and cached in the data volume.
+Default data dir:
+
+- Linux: `$XDG_DATA_HOME/getbased/lens` or `~/.local/share/getbased/lens`
+- macOS: `~/Library/Application Support/getbased/lens`
+- Windows: `%APPDATA%\getbased\lens`
+
+A legacy `~/.getbased/lens` is honored if it already exists, so pre-v1.21 installs don't lose their data.
 
 ### GPU acceleration
 
-The `:latest` image ships the CPU provider. For CUDA:
-
-1. Install the NVIDIA Container Toolkit on your host.
-2. Run with `--gpus all` and `LENS_ONNX_PROVIDER=cuda`.
+Install the matching `onnxruntime-*` wheel (e.g. `onnxruntime-gpu` for CUDA), then:
 
 ```bash
-docker run -d --gpus all \
-  -p 127.0.0.1:8322:8322 \
-  -v lens-data:/data \
-  -e LENS_ONNX_PROVIDER=cuda \
-  ghcr.io/elkimek/getbased-rag:latest
+LENS_ONNX_PROVIDER=cuda lens serve
 ```
-
-For other providers (ROCm, DirectML, CoreML) you'll want a custom image that installs the matching `onnxruntime-*` wheel.
 
 ---
 
 ## HTTP API
 
-All endpoints (except `/health` and `/`) require `Authorization: Bearer <key>`.
+All endpoints (except `/` and `/health`) require `Authorization: Bearer <key>`.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -121,35 +126,29 @@ All endpoints (except `/health` and `/`) require `Authorization: Bearer <key>`.
 
 ## Security notes
 
-- The default bind is `127.0.0.1` outside Docker — queries never leak to the LAN unless you explicitly set `LENS_HOST=0.0.0.0`.
-- In Docker, the published port is pinned to `127.0.0.1:8322` in `docker-compose.yml`. If you want LAN access, change it to `8322:8322` — but then please also use a reverse proxy with TLS.
-- The API key in `/data/api_key` is mode `0600` and never exposed over HTTP (use `lens key` locally to read it).
+- Default bind is `127.0.0.1` — queries never leak to the LAN unless you explicitly set `LENS_HOST=0.0.0.0`.
+- The API key file is mode `0600` and never exposed over HTTP. Use `lens key` locally to read it.
+- If you expose the server to a LAN or the internet, front it with a reverse proxy that terminates TLS and rate-limits.
 
 ---
 
-## Development (no Docker)
+## CLI
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[full]"
-lens serve
 ```
-
-In another terminal:
-
-```bash
-lens key
-lens info
-lens ingest ./some-directory
-lens stats
+lens serve            Start the HTTP server (default)
+lens ingest <path>    Index files into the local store
+lens stats            List indexed sources + chunk counts
+lens delete <source>  Drop chunks belonging to one source
+lens clear            Wipe the active library
+lens info             Show config + API key
+lens key              Print the API key (creates one if missing)
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] CUDA / DirectML Docker variants
+- [ ] Docker image (on request)
 - [ ] Configurable embedding model tier (small / base / large) with guardrails
 - [ ] OpenAPI-generated client for the PWA `external-server` backend
 - [ ] Optional multi-tenant mode (per-owner API keys + library quotas)
